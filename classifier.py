@@ -3,22 +3,33 @@ import os
 from PIL import Image
 import wandb
 
+
+
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 import torch.nn.functional as F
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, precision_recall_curve, auc, average_precision_score
 
 from torchvision import transforms
+
 from accelerate import Accelerator
 
 import numpy as np
 
-from transformers import AutoConfig, AutoTokenizer, AutoModelForSequenceClassification
+from transformers import AutoConfig, AutoTokenizer, AutoModelForSequenceClassification, CLIPProcessor, CLIPVisionModel, CLIPVisionConfig
 from timm.models.layers import to_2tuple
+from timm.data import Mixup
 
-def compute_metrics(labels, preds):
+def compute_metrics(epoch, labels, preds):
+
+    # 保存当前epoch的标签和预测值
+    save_path = f"{wandb.run.dir}/tmp/epoch_{epoch}_output.npz"
+    np.savez(save_path, labels=labels, preds=preds)
+    artifact = wandb.Artifact(name=f"outputs_epoch_{epoch}", type="model_outputs", description=f"Predictions and labels for epoch {epoch}")
+    artifact.add_file(save_path)
+    wandb.log_artifact(artifact)
     # 将概率转换为二进制预测
     preds_binary = (preds > 0.5).astype(np.int16)
 
@@ -37,13 +48,16 @@ def compute_metrics(labels, preds):
 
     # 计算 AUROC
     auroc = roc_auc_score(labels, preds)
+    precisions, recalls, _ = precision_recall_curve(labels, preds)
+    auprc = auc(recalls, precisions)
     wandb.log({
         "Specificity": specificity,
         "Sensitivity": sensitivity,
         "Accuracy": accuracy,
         "Precision": precision,
         "F1 Score": f1,
-        "AUROC": auroc
+        "AUROC": auroc,
+        "AUPRC": auprc
     })
     preds_2cls = [[1 - prob, prob] for prob in preds]
     preds_int = np.where(preds >= 0.5, 1, 0).astype(int)
@@ -56,50 +70,15 @@ def compute_metrics(labels, preds):
             preds=preds_int,class_names=class_names)
     })
 
-
-class PatchEmbed(nn.Module):
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768):
+class VisionEncoder(nn.Module):
+    def __init__(self, model="/data/llm_weights/clip-vit-large-patch14"):
         super().__init__()
-        img_size = to_2tuple(img_size)
-        patch_size = to_2tuple(patch_size)
-        num_patches = (img_size[1] // patch_size[1]) * (img_size[0] // patch_size[0])
-        self.patch_shape = (img_size[0] // patch_size[0], img_size[1] // patch_size[1])
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.num_patches = num_patches
-
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
-
-    def forward(self, x, **kwargs):
-        B, C, H, W = x.shape
-        assert H == self.img_size[0] and W == self.img_size[1], \
-            f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
-        x = self.proj(x).flatten(2).transpose(1, 2)
-
-        return x
-    
-class FixedFFT(nn.Module):
-    def __init__(self, in_chans=3, embed_dim=2048, img_size=224, patch_size=14):
-        super().__init__()
-        self.in_chans = in_chans
-        self.img_size = img_size
-        self.num_features = self.embed_dim = embed_dim
-        self.patch_size = patch_size
-        assert self.img_size % self.patch_size == 0, "img_size is not divisible by patch_size"
-        self.num_tokens = (self.img_size//self.patch_size) * (self.img_size//self.patch_size)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.patch_embed = PatchEmbed(
-            img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
-
+        self.model = CLIPVisionModel.from_pretrained(model)
+        self.vision_config =  CLIPVisionConfig.from_pretrained("openai/clip-vit-large-patch14")
+        self.num_features = self.vision_config.hidden_size
     def forward(self, x):
-        x = self.patch_embed(x)
-        # B, H/p*W/p+1, dim
-        batch_size, seq_len, _ = x.size()
-        freq = torch.fft.fft(x, dim=(-2), n=self.num_tokens, norm="ortho")
-        x = torch.abs(freq)
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
-        return x
+        return self.model(x).last_hidden_state
+
 
 # PyTorch 数据集类
 class MedicalImageDataset(Dataset):
@@ -133,13 +112,7 @@ class MedicalImageDataset(Dataset):
 
         return image, input_ids, label
 
-# 定义图像转换
-transform = transforms.Compose([
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.RandomVerticalFlip(p=0.5),
-    transforms.RandomRotation(10),
-    transforms.ToTensor(),
-    ])
+
 
 class fftVLM(nn.Module):
     def __init__(self, img_size=224, patch_size=14, in_chans=3, embed_dim=2048, model_name="1B", mode="mixed"):
@@ -149,20 +122,21 @@ class fftVLM(nn.Module):
         self.llama_model_classifier = AutoModelForSequenceClassification.from_config(self.llama_config)
         self.llama_model_classifier.config.pad_token_id = self.llama_model_classifier.config.eos_token_id
         if self.mode in ["image", "mixed"]:
-            self.vision_encoder = FixedFFT(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
+            self.vision_encoder = VisionEncoder()
             self.ln_vision = nn.LayerNorm(self.vision_encoder.num_features)
             self.llama_proj = nn.Linear(self.vision_encoder.num_features, self.llama_model_classifier.config.hidden_size)
-        print(self.llama_config)
-        print(self.llama_model_classifier)
+            for name, param in self.vision_encoder.named_parameters():
+                param.requires_grad = False
         for name, param in self.llama_model_classifier.named_parameters():
             if "score" not in name:
                 param.requires_grad = False
         
     
     def forward(self, images, input_ids, labels):
+
         if self.mode in ["image", "mixed"]:
             image_embeds = self.ln_vision(self.vision_encoder(images))
-            bs, pn, hs = image_embeds.shape
+            # bs, pn, hs = image_embeds.shape
             aligned_image_embeds = self.llama_proj(image_embeds)
         text_embeds = self.llama_model_classifier.base_model.embed_tokens(input_ids)
         if self.mode in ["image"]:
@@ -171,6 +145,8 @@ class fftVLM(nn.Module):
             mixed_embeds = text_embeds
         elif self.mode in ["mixed"]:
             mixed_embeds = torch.concat((aligned_image_embeds, text_embeds), dim=1)
+        
+
         attention_masks = torch.ones_like(mixed_embeds)
         outputs =self.llama_model_classifier(
                 inputs_embeds=mixed_embeds,
@@ -186,20 +162,44 @@ def main():
     wandb.init(project="minigpt")
     wandb.save("classifier.py")
     epochs = 50
-    gradient_accumulation_steps = 8
+    gradient_accumulation_steps = 16
     accelerator = Accelerator()
     train_image_path = "/data/datasets/HMBM/samples_train/image"
     test_image_path = "/data/datasets/HMBM/samples_test/image"
     model_name = "/data/llm_weights/1B"
+    
+    transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
+        transforms.RandomRotation(10),
+        transforms.ToTensor(),
+        ])
+
+    # mixup_fn = Mixup(
+    #     mixup_alpha=0.8,
+    #     cutmix_alpha=1.0,
+    #     cutmix_minmax=None,
+    #     prob=1.0,
+    #     switch_prob=0.5,
+    #     mode="batch",
+    #     label_smoothing= 0.1,
+    #     num_classes=2
+    #     )
     train_dataset = MedicalImageDataset(train_image_path, transform=transform, model_name=model_name)
-    train_dataloader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+    train_dataloader = DataLoader(
+        train_dataset, batch_size=2, shuffle=True,
+        drop_last=True, num_workers=4, persistent_workers=True
+        )
     test_dataset = MedicalImageDataset(test_image_path, transform=transform, model_name=model_name)
-    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=True)
+    test_dataloader = DataLoader(
+        test_dataset, batch_size=1, shuffle=False,
+        drop_last=False, num_workers=4, persistent_workers=True
+        )
     if accelerator.is_main_process:
         print("train dataset length:",len(train_dataset))
         print("test dataset length:",len(test_dataset))
     
-    model = accelerator.prepare(fftVLM(model_name=model_name, mode="mixed"))
+    model = accelerator.prepare(fftVLM(model_name=model_name, mode="image"))
     optimizer = AdamW(model.parameters(), lr=5e-5, betas=(0.9, 0.95), weight_decay=1e-5)
     optimizer, train_dataloader, test_dataloader = accelerator.prepare(
         optimizer, train_dataloader, test_dataloader
@@ -211,11 +211,17 @@ def main():
             print("*"*10)
             print("epoch:",epoch)
         for index,(images, captions, labels) in enumerate(train_dataloader):
+            # if mixup_fn is not None: 
+            #     images, labels = mixup_fn(images, labels)
+            
             loss = model(images, captions, labels)["loss"]
             loss = loss / gradient_accumulation_steps
             accelerator.backward(loss)
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(model.parameters(), 5.0)
+            accelerator.wait_for_everyone()
             if (index+1) % gradient_accumulation_steps == 0:
-                wandb.log({"loss":loss})
+                wandb.log({"loss":loss.mean(0)})
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -235,7 +241,10 @@ def main():
                 all_logits = F.softmax(torch.concat(all_logits),dim=1)[:,1].cpu().numpy()
                 all_labels = torch.concat(all_labels, dim=0).squeeze().cpu().numpy()
                 print(all_logits.shape, all_labels.shape)
-                compute_metrics(all_labels, all_logits)
+                compute_metrics(epoch, all_labels, all_logits)
+    
+    wandb.finish()    
                 
 if __name__ == "__main__":
-    main()      
+    main()
+      
